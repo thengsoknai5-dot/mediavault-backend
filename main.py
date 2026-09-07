@@ -56,9 +56,21 @@ if _COOKIES_ENV:
 
 
 def with_cookies(opts: dict) -> dict:
-    """Attach cookiefile to yt-dlp opts if YOUTUBE_COOKIES is configured."""
+    """Attach cookiefile + YouTube bot-check mitigations to yt-dlp opts."""
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
+    # Datacenter IPs (Railway, AWS, etc.) get flagged by YouTube's bot check
+    # even with valid cookies. Using the Android/iOS player client skips the
+    # web player's bot-check path entirely — this is the standard yt-dlp
+    # workaround as of 2025-2026.
+    opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android", "ios", "web"],
+        }
+    }
+    opts["http_headers"] = {
+        "User-Agent": "com.google.android.youtube/19.29.37 (Linux; U; Android 11) gzip",
+    }
     return opts
 
 
