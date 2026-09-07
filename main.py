@@ -1,349 +1,409 @@
-"""
-MediaVault Backend - Personal media management utility
-FastAPI service wrapping yt-dlp, ffmpeg, deep-translator, and Coqui TTS.
+r"""
+MediaVault Backend - FastAPI Server
+====================================
+Copy this file to: C:\Users\nguon\mediavault-backend\main.py
+Then run: python -m uvicorn main:app --reload --port 8000
 
-For personal use on content you own or have permission to use.
+Requirements (already installed):
+  fastapi, uvicorn, yt-dlp, python-multipart, deep-translator
 """
 
 import os
 import uuid
+import asyncio
 import subprocess
-import shutil
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import yt_dlp
-
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="MediaVault Backend")
+# ── App setup ──────────────────────────────────────────────────────────────────
+app = FastAPI(title="MediaVault API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-        allow_origins=["*"],  # Next.js dev server
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://mediavault4594.builtwithrocket.new",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).parent
-DOWNLOADS_DIR = BASE_DIR / "downloads"
-TRIMMED_DIR = BASE_DIR / "trimmed"
-SUBS_DIR = BASE_DIR / "subtitles"
-DUBBED_DIR = BASE_DIR / "dubbed"
+# ── In-memory job store ────────────────────────────────────────────────────────
+jobs: Dict[str, Dict[str, Any]] = {}
 
-for d in (DOWNLOADS_DIR, TRIMMED_DIR, SUBS_DIR, DUBBED_DIR):
-    d.mkdir(exist_ok=True)
+# ── Download directory ─────────────────────────────────────────────────────────
+DOWNLOAD_DIR = Path(os.path.expanduser("~")) / "mediavault-downloads"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Serve processed files so the frontend can preview/download them
-app.mount("/files/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
-app.mount("/files/trimmed", StaticFiles(directory=TRIMMED_DIR), name="trimmed")
-app.mount("/files/dubbed", StaticFiles(directory=DUBBED_DIR), name="dubbed")
+# ── YouTube cookies (fixes "Sign in to confirm you're not a bot") ──────────────
+# Set the YOUTUBE_COOKIES env var (Railway → Variables) to the full contents of
+# a cookies.txt file exported from a logged-in YouTube session (Netscape format,
+# e.g. via the "Get cookies.txt LOCALLY" browser extension). If set, we write it
+# to a temp file once at startup and pass it to yt-dlp as cookiefile.
+_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
+COOKIES_FILE: Optional[str] = None
+if _COOKIES_ENV:
+    _cookies_path = Path(os.path.expanduser("~")) / "mediavault-cookies.txt"
+    _cookies_path.write_text(_COOKIES_ENV, encoding="utf-8")
+    COOKIES_FILE = str(_cookies_path)
 
-# In-memory job tracking (fine for a personal single-user tool;
-# swap for a DB/file store if you need persistence across restarts)
-JOBS: dict[str, dict] = {}
+
+def with_cookies(opts: dict) -> dict:
+    """Attach cookiefile to yt-dlp opts if YOUTUBE_COOKIES is configured."""
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
 
 
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-
+# ── Request / Response models ──────────────────────────────────────────────────
 class MediaInfoRequest(BaseModel):
     url: str
 
 
 class SaveRequest(BaseModel):
     url: str
-    mode: str = "video_audio"   # "video_audio" | "video_only" | "audio_only"
-    quality: str = "best"       # e.g. "1080", "720", "480", "best"
+    format_id: Optional[str] = "bestvideo+bestaudio/best"
+    output_name: Optional[str] = None
+    audio_only: Optional[bool] = False
 
 
 class TrimRequest(BaseModel):
-    file_path: str  # path returned by /save, relative to downloads dir
-    start_time: float  # seconds
-    end_time: float    # seconds
-
-
-class TranslateRequest(BaseModel):
-    text: str
-    target_lang: str  # e.g. "km" for Khmer, "en", "zh-CN"
-
-
-class DubRequest(BaseModel):
     file_path: str
-    translated_text: str
-    target_lang: str
-    replace_audio: bool = True
+    start_time: str   # e.g. "00:00:10" end_time: str     # e.g."00:01:30"
+    output_name: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+class TranslateSubtitleRequest(BaseModel):
+    text: str
+    source_lang: Optional[str] = "auto"
+    target_lang: str = "en"
 
 
-# ---------------------------------------------------------------------------
-# 1. Media info
-# ---------------------------------------------------------------------------
-
-@app.post("/media-info")
-def media_info(req: MediaInfoRequest):
-    ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True}
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not fetch media info: {e}")
-
-    formats = []
-    for f in info.get("formats", []):
-        if f.get("vcodec") != "none" and f.get("height"):
-            formats.append({
-                "format_id": f["format_id"],
-                "resolution": f"{f.get('height')}p",
-                "ext": f.get("ext"),
-            })
-
-    subtitles = list(info.get("subtitles", {}).keys()) + list(info.get("automatic_captions", {}).keys())
-
-    return {
-        "title": info.get("title"),
-        "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"),
-        "uploader": info.get("uploader"),
-        "formats": formats,
-        "subtitle_languages": sorted(set(subtitles)),
-        "platform": info.get("extractor_key"),
-    }
+class DubAudioRequest(BaseModel):
+    video_path: str
+    audio_path: str
+    output_name: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# 2. Save / download
-# ---------------------------------------------------------------------------
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def format_duration(seconds: float) -> str:
+    """Convert seconds to HH:MM:SS string."""
+    if not seconds:
+        return "0:00"
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
-def _run_download(job_id: str, url: str, mode: str, quality: str):
-    JOBS[job_id] = {"status": "running", "progress": 0}
+
+def run_download(job_id: str, url: str, ydl_opts: dict):
+    """Background thread: run yt-dlp download and update job store."""
+    import yt_dlp
+
+    jobs[job_id]["status"] = "downloading"
+    jobs[job_id]["progress"] = 0
 
     def progress_hook(d):
         if d["status"] == "downloading":
-            pct = d.get("_percent_str", "0%").strip().replace("%", "")
-            try:
-                JOBS[job_id]["progress"] = float(pct)
-            except ValueError:
-                pass
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            if total > 0:
+                pct = int(downloaded / total * 100)
+                jobs[job_id]["progress"] = pct
+                jobs[job_id]["speed"] = d.get("speed", 0)
+                jobs[job_id]["eta"] = d.get("eta", 0)
         elif d["status"] == "finished":
-            JOBS[job_id]["progress"] = 100
+            jobs[job_id]["progress"] = 100
+            jobs[job_id]["filename"] = d.get("filename", "")
 
-    out_tmpl = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
-
-    if mode == "audio_only":
-        fmt = "bestaudio/best"
-        postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]
-    elif mode == "video_only":
-        fmt = f"bestvideo[height<={quality}]" if quality != "best" else "bestvideo"
-        postprocessors = []
-    else:  # video_audio
-        fmt = f"bestvideo[height<={quality}]+bestaudio/best" if quality != "best" else "best"
-        postprocessors = []
-
-    ydl_opts = {
-        "format": fmt,
-        "outtmpl": out_tmpl,
-        "postprocessors": postprocessors,
-        "progress_hooks": [progress_hook],
-        "noplaylist": True,
-        "quiet": True,
-    }
+    ydl_opts["progress_hooks"] = [progress_hook]
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if mode == "audio_only":
-                filename = str(Path(filename).with_suffix(".mp3"))
-        JOBS[job_id] = {
-            "status": "done",
-            "progress": 100,
-            "file_path": Path(filename).name,
-            "title": info.get("title"),
-        }
+            jobs[job_id]["status"] = "completed"
+            jobs[job_id]["progress"] = 100
+            jobs[job_id]["title"] = info.get("title", "")
+            jobs[job_id]["filename"] = ydl.prepare_filename(info)
     except Exception as e:
-        JOBS[job_id] = {"status": "error", "error": str(e)}
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    """Health check — frontend polls this to show green/red dot."""
+    return {
+        "status": "ok",
+        "message": "MediaVault backend is running",
+        "youtube_cookies_configured": COOKIES_FILE is not None,
+    }
+
+
+@app.post("/media-info")
+def media_info(req: MediaInfoRequest):
+    """
+    Fetch video metadata using yt-dlp (no download).
+    Returns title, duration, thumbnail, formats, etc.
+    """
+    import yt_dlp
+
+    ydl_opts = with_cookies({
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    })
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(req.url, download=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Build format list
+    raw_formats = info.get("formats", [])
+    formats = []
+    seen = set()
+    for f in raw_formats:
+        label = f.get("format_note") or f.get("resolution") or f.get("format_id", "")
+        ext = f.get("ext", "")
+        fid = f.get("format_id", "")
+        key = f"{label}-{ext}"
+        if key in seen:
+            continue
+        seen.add(key)
+        filesize = f.get("filesize") or f.get("filesize_approx") or 0
+        formats.append({
+            "format_id": fid,
+            "label": label,
+            "ext": ext,
+            "resolution": f.get("resolution", ""),
+            "fps": f.get("fps"),
+            "vcodec": f.get("vcodec", ""),
+            "acodec": f.get("acodec", ""),
+            "filesize": filesize,
+            "filesize_mb": round(filesize / 1024 / 1024, 2) if filesize else None,
+        })
+
+    return {
+        "title": info.get("title", ""),
+        "duration": format_duration(info.get("duration", 0)),
+        "duration_seconds": info.get("duration", 0),
+        "thumbnail": info.get("thumbnail", ""),
+        "channel": info.get("uploader", info.get("channel", "")),
+        "view_count": info.get("view_count", 0),
+        "upload_date": info.get("upload_date", ""),
+        "description": info.get("description", "")[:500] if info.get("description") else "",
+        "webpage_url": info.get("webpage_url", req.url),
+        "formats": formats,
+    }
 
 
 @app.post("/save")
 def save(req: SaveRequest, background_tasks: BackgroundTasks):
+    """
+    Start a yt-dlp download job.
+    Returns a job_id for polling via /save-progress.
+    """
     job_id = str(uuid.uuid4())
-    background_tasks.add_task(_run_download, job_id, req.url, req.mode, req.quality)
-    return {"job_id": job_id}
+
+    output_template = str(DOWNLOAD_DIR / (req.output_name or "%(title)s.%(ext)s"))
+
+    ydl_opts: dict = with_cookies({
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    })
+
+    if req.audio_only:
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    else:
+        ydl_opts["format"] = req.format_id or "bestvideo+bestaudio/best"
+        ydl_opts["merge_output_format"] = "mp4"
+
+    jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "url": req.url,
+        "speed": 0,
+        "eta": 0,
+        "filename": "",
+        "error": "",
+    }
+
+    t = threading.Thread(
+        target=run_download,
+        args=(job_id, req.url, ydl_opts),
+        daemon=True,
+    )
+    t.start()
+
+    return {"job_id": job_id, "status": "queued", "download_dir": str(DOWNLOAD_DIR)}
 
 
-@app.get("/save/status/{job_id}")
-def save_status(job_id: str):
-    job = JOBS.get(job_id)
-    if not job:
+@app.get("/save-progress/{job_id}")
+def save_progress(job_id: str):
+    """Poll download progress for a given job_id."""
+    if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return jobs[job_id]
 
-
-# ---------------------------------------------------------------------------
-# 3. Trim
-# ---------------------------------------------------------------------------
 
 @app.post("/trim")
 def trim(req: TrimRequest):
-    src = DOWNLOADS_DIR / req.file_path
-    if not src.exists():
-        raise HTTPException(status_code=404, detail="Source file not found")
+    """
+    Trim a video/audio file using ffmpeg.
+    Requires ffmpeg to be installed and on PATH.
+    """
+    input_path = Path(req.file_path)
+    if not input_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {req.file_path}")
 
-    duration = req.end_time - req.start_time
-    if duration <= 0:
-        raise HTTPException(status_code=400, detail="end_time must be after start_time")
-
-    out_name = f"trim_{uuid.uuid4().hex[:8]}_{src.name}"
-    out_path = TRIMMED_DIR / out_name
+    suffix = input_path.suffix
+    out_name = req.output_name or f"{input_path.stem}_trimmed{suffix}"
+    output_path = DOWNLOAD_DIR / out_name
 
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(req.start_time),
-        "-i", str(src),
-        "-t", str(duration),
+        "-i", str(input_path),
+        "-ss", req.start_time,
+        "-to", req.end_time,
         "-c", "copy",
-        str(out_path),
+        str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if result.returncode != 0 or not out_path.exists():
-        # Fallback: re-encode (stream copy can fail on some keyframe boundaries)
-        cmd_reencode = [
-            "ffmpeg", "-y",
-            "-ss", str(req.start_time),
-            "-i", str(src),
-            "-t", str(duration),
-            str(out_path),
-        ]
-        result = subprocess.run(cmd_reencode, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"ffmpeg trim failed: {result.stderr[-500:]}")
-
-    return {"file_path": out_name, "url": f"/files/trimmed/{out_name}"}
-
-
-# ---------------------------------------------------------------------------
-# 4. Translate subtitles
-# ---------------------------------------------------------------------------
-
-@app.post("/translate-subtitle")
-def translate_subtitle(req: TranslateRequest):
     try:
-        from deep_translator import GoogleTranslator
-        translated = GoogleTranslator(source="auto", target=req.target_lang).translate(req.text)
-        return {"translated_text": translated, "engine": "deep-translator"}
-    except Exception as e:
-        # Offline fallback
-        try:
-            import argostranslate.translate
-            translated = argostranslate.translate.translate(req.text, "en", req.target_lang)
-            return {"translated_text": translated, "engine": "argos-translate (offline)"}
-        except Exception as e2:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
             raise HTTPException(
                 status_code=500,
-                detail=f"Translation failed. Online error: {e}. Offline fallback error: {e2}"
+                detail=f"ffmpeg error: {result.stderr[-500:]}"
             )
-
-
-# ---------------------------------------------------------------------------
-# 5. Voice dubbing (Coqui TTS)
-# ---------------------------------------------------------------------------
-
-def _run_dub(job_id: str, file_path: str, translated_text: str, target_lang: str, replace_audio: bool):
-    JOBS[job_id] = {"status": "running"}
-    try:
-        src = DOWNLOADS_DIR / file_path
-        if not src.exists():
-            src = TRIMMED_DIR / file_path
-        if not src.exists():
-            raise FileNotFoundError("Source video not found")
-
-        work_dir = DUBBED_DIR / job_id
-        work_dir.mkdir(exist_ok=True)
-
-        # 1. Extract a short voice sample from the original audio for cloning
-        sample_path = work_dir / "speaker_sample.wav"
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(src),
-            "-t", "10", "-ac", "1", "-ar", "22050",
-            str(sample_path)
-        ], capture_output=True, check=True)
-
-        # 2. Generate dubbed speech with Coqui XTTS-v2, cloning the sample voice
-        from TTS.api import TTS
-        tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-        dubbed_audio_path = work_dir / "dubbed_audio.wav"
-        tts.tts_to_file(
-            text=translated_text,
-            speaker_wav=str(sample_path),
-            language=target_lang,
-            file_path=str(dubbed_audio_path),
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="ffmpeg not found. Install ffmpeg and add it to PATH."
         )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="ffmpeg timed out")
 
-        # 3. Merge dubbed audio into the video
-        out_name = f"dubbed_{src.stem}.mp4"
-        out_path = DUBBED_DIR / out_name
+    return {
+        "status": "completed",
+        "output_path": str(output_path),
+        "output_name": out_name,
+    }
 
-        if replace_audio:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(src),
-                "-i", str(dubbed_audio_path),
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-shortest",
-                str(out_path),
-            ]
+
+@app.post("/translate-subtitle")
+def translate_subtitle(req: TranslateSubtitleRequest):
+    """
+    Translate text using deep-translator (Google Translate backend).
+    """
+    try:
+        from deep_translator import GoogleTranslator
+        translator = GoogleTranslator(
+            source=req.source_lang,
+            target=req.target_lang,
+        )
+        # deep-translator has a 5000-char limit per call — chunk if needed
+        MAX_CHUNK = 4500
+        text = req.text
+        if len(text) <= MAX_CHUNK:
+            translated = translator.translate(text)
         else:
-            # Keep both audio tracks
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(src),
-                "-i", str(dubbed_audio_path),
-                "-map", "0:v:0", "-map", "0:a:0", "-map", "1:a:0",
-                "-c:v", "copy",
-                str(out_path),
-            ]
-        subprocess.run(cmd, capture_output=True, check=True)
+            chunks = [text[i:i + MAX_CHUNK] for i in range(0, len(text), MAX_CHUNK)]
+            translated = " ".join(translator.translate(c) for c in chunks)
 
-        JOBS[job_id] = {
-            "status": "done",
-            "file_path": out_name,
-            "url": f"/files/dubbed/{out_name}",
+        return {
+            "status": "ok",
+            "source_lang": req.source_lang,
+            "target_lang": req.target_lang,
+            "original": req.text,
+            "translated": translated,
         }
     except Exception as e:
-        JOBS[job_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/dub-audio")
-def dub_audio(req: DubRequest, background_tasks: BackgroundTasks):
-    job_id = str(uuid.uuid4())
-    background_tasks.add_task(
-        _run_dub, job_id, req.file_path, req.translated_text, req.target_lang, req.replace_audio
-    )
-    return {"job_id": job_id}
+def dub_audio(req: DubAudioRequest):
+    """
+    Replace the audio track of a video with a new audio file using ffmpeg.
+    """
+    video_path = Path(req.video_path)
+    audio_path = Path(req.audio_path)
+
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail=f"Video not found: {req.video_path}")
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail=f"Audio not found: {req.audio_path}")
+
+    out_name = req.output_name or f"{video_path.stem}_dubbed.mp4"
+    output_path = DOWNLOAD_DIR / out_name
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-c:v", "copy",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"ffmpeg error: {result.stderr[-500:]}"
+            )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="ffmpeg not found. Install ffmpeg and add it to PATH."
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="ffmpeg timed out")
+
+    return {
+        "status": "completed",
+        "output_path": str(output_path),
+        "output_name": out_name,
+    }
 
 
-@app.get("/dub-audio/status/{job_id}")
-def dub_status(job_id: str):
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+# ── Dev entry point ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
