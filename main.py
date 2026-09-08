@@ -43,21 +43,22 @@ DOWNLOAD_DIR = Path(os.path.expanduser("~")) / "mediavault-downloads"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── YouTube cookies (fixes "Sign in to confirm you're not a bot") ──────────────
-# Set the YOUTUBE_COOKIES env var (Railway → Variables) to the full contents of
-# a cookies.txt file exported from a logged-in YouTube session (Netscape format,
-# e.g. via the "Get cookies.txt LOCALLY" browser extension). If set, we write it
-# to a temp file once at startup and pass it to yt-dlp as cookiefile.
-_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
-COOKIES_FILE: Optional[str] = None
-if _COOKIES_ENV:
-    _cookies_path = Path(os.path.expanduser("~")) / "mediavault-cookies.txt"
-    _cookies_path.write_text(_COOKIES_ENV, encoding="utf-8")
-    COOKIES_FILE = str(_cookies_path)
+# Cookies can come from either the YOUTUBE_COOKIES env var (set once in Railway)
+# or be updated live via POST /settings/cookies from the app's Settings panel —
+# useful since YouTube session cookies expire every few days/weeks and editing
+# Railway variables + redeploying every time is slow. Either way they end up in
+# the same file on disk, and with_cookies() checks the file fresh on every
+# request so an update takes effect immediately with no restart needed.
+COOKIES_FILE = str(Path(os.path.expanduser("~")) / "mediavault-cookies.txt")
+
+_env_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+if _env_cookies:
+    Path(COOKIES_FILE).write_text(_env_cookies, encoding="utf-8")
 
 
 def with_cookies(opts: dict) -> dict:
     """Attach cookiefile + YouTube bot-check mitigations to yt-dlp opts."""
-    if COOKIES_FILE:
+    if Path(COOKIES_FILE).exists() and Path(COOKIES_FILE).stat().st_size > 0:
         opts["cookiefile"] = COOKIES_FILE
     # Datacenter IPs (Railway, AWS, etc.) get flagged by YouTube's bot check
     # even with valid cookies. Using the Android/iOS player client skips the
@@ -72,6 +73,33 @@ def with_cookies(opts: dict) -> dict:
         "User-Agent": "com.google.android.youtube/19.29.37 (Linux; U; Android 11) gzip",
     }
     return opts
+
+
+class CookiesUpdateRequest(BaseModel):
+    cookies: str
+
+
+@app.post("/settings/cookies")
+async def update_cookies(req: CookiesUpdateRequest):
+    """Update the YouTube cookies file at runtime (no redeploy needed)."""
+    content = req.cookies.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="cookies must not be empty")
+    Path(COOKIES_FILE).write_text(content, encoding="utf-8")
+    return {"status": "ok", "message": "Cookies updated", "bytes": len(content)}
+
+
+@app.get("/settings/cookies-status")
+async def cookies_status():
+    """Whether cookies are currently configured, and roughly how fresh."""
+    p = Path(COOKIES_FILE)
+    if not p.exists() or p.stat().st_size == 0:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "updated_at": p.stat().st_mtime,
+        "size_bytes": p.stat().st_size,
+    }
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -140,16 +168,37 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
 
     ydl_opts["progress_hooks"] = [progress_hook]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            jobs[job_id]["status"] = "completed"
-            jobs[job_id]["progress"] = 100
-            jobs[job_id]["title"] = info.get("title", "")
-            jobs[job_id]["filename"] = ydl.prepare_filename(info)
-    except Exception as e:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
+    # The requested format may not exist under the android/ios player clients
+    # (their format IDs differ from the web client's). Try the requested
+    # format first, then fall back to progressively looser selectors.
+    original_format = ydl_opts.get("format")
+    fallback_formats = [
+        original_format,
+        "bv*+ba/b",
+        "best",
+    ]
+    # de-dupe while preserving order
+    seen_f = set()
+    fallback_formats = [f for f in fallback_formats if f and not (f in seen_f or seen_f.add(f))]
+
+    last_error = None
+    for fmt in fallback_formats:
+        try:
+            attempt_opts = dict(ydl_opts)
+            attempt_opts["format"] = fmt
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                jobs[job_id]["status"] = "completed"
+                jobs[job_id]["progress"] = 100
+                jobs[job_id]["title"] = info.get("title", "")
+                jobs[job_id]["filename"] = ydl.prepare_filename(info)
+                return
+        except Exception as e:
+            last_error = e
+            continue
+
+    jobs[job_id]["status"] = "error"
+    jobs[job_id]["error"] = str(last_error) if last_error else "Download failed"
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -160,7 +209,7 @@ def health():
     return {
         "status": "ok",
         "message": "MediaVault backend is running",
-        "youtube_cookies_configured": COOKIES_FILE is not None,
+        "youtube_cookies_configured": Path(COOKIES_FILE).exists() and Path(COOKIES_FILE).stat().st_size > 0,
     }
 
 
@@ -249,7 +298,14 @@ def save(req: SaveRequest, background_tasks: BackgroundTasks):
             "preferredquality": "192",
         }]
     else:
-        ydl_opts["format"] = req.format_id or "bestvideo+bestaudio/best"
+        # Deliberately ignore req.format_id: format IDs returned by
+        # /media-info come from whichever player client (web/android/ios)
+        # yt-dlp used for that call, and the same ID may not exist when
+        # /save runs its own extraction — that mismatch caused "Requested
+        # format is not available". "bv*+ba/b" is a flexible selector: best
+        # video (any codec/container) + best audio, falling back to the
+        # single best pre-merged stream if that combination fails.
+        ydl_opts["format"] = "bv*+ba/b"
         ydl_opts["merge_output_format"] = "mp4"
 
     jobs[job_id] = {
