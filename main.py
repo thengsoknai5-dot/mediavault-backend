@@ -163,34 +163,36 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
 
     ydl_opts["progress_hooks"] = [progress_hook]
 
-    # The requested format may not exist under the android/ios player clients
-    # (their format IDs differ from the web client's). Try the requested
-    # format first, then fall back to progressively looser selectors.
+    # Different YouTube "player clients" (web, ios, android, tv) each expose
+    # their own format list, get rate-limited/blocked differently, and
+    # sometimes require a PO token that only some of them supply
+    # automatically. This is a moving target as YouTube changes its anti-bot
+    # rules, so rather than betting on one client we try several client +
+    # format combinations in turn and keep whichever actually works.
     original_format = ydl_opts.get("format")
-    fallback_formats = [
-        original_format,
-        "bv*+ba/b",
-        "best",
-    ]
+    client_strategies = ["web", "ios", "android", "tv"]
+    formats_to_try = [f for f in [original_format, "bv*+ba/b", "best"] if f]
     # de-dupe while preserving order
-    seen_f = set()
-    fallback_formats = [f for f in fallback_formats if f and not (f in seen_f or seen_f.add(f))]
+    seen_f: set = set()
+    formats_to_try = [f for f in formats_to_try if not (f in seen_f or seen_f.add(f))]
 
     last_error = None
-    for fmt in fallback_formats:
-        try:
-            attempt_opts = dict(ydl_opts)
-            attempt_opts["format"] = fmt
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                jobs[job_id]["status"] = "completed"
-                jobs[job_id]["progress"] = 100
-                jobs[job_id]["title"] = info.get("title", "")
-                jobs[job_id]["filename"] = ydl.prepare_filename(info)
-                return
-        except Exception as e:
-            last_error = e
-            continue
+    for client in client_strategies:
+        for fmt in formats_to_try:
+            try:
+                attempt_opts = dict(ydl_opts)
+                attempt_opts["format"] = fmt
+                attempt_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    jobs[job_id]["status"] = "completed"
+                    jobs[job_id]["progress"] = 100
+                    jobs[job_id]["title"] = info.get("title", "")
+                    jobs[job_id]["filename"] = ydl.prepare_filename(info)
+                    return
+            except Exception as e:
+                last_error = e
+                continue
 
     jobs[job_id]["status"] = "error"
     jobs[job_id]["error"] = str(last_error) if last_error else "Download failed"
