@@ -57,21 +57,15 @@ if _env_cookies:
 
 
 def with_cookies(opts: dict) -> dict:
-    """Attach cookiefile + YouTube bot-check mitigations to yt-dlp opts."""
+    """Attach cookiefile for YouTube bot-check bypass."""
     if Path(COOKIES_FILE).exists() and Path(COOKIES_FILE).stat().st_size > 0:
         opts["cookiefile"] = COOKIES_FILE
-    # Datacenter IPs (Railway, AWS, etc.) get flagged by YouTube's bot check
-    # even with valid cookies. Using the Android/iOS player client skips the
-    # web player's bot-check path entirely — this is the standard yt-dlp
-    # workaround as of 2025-2026.
-    opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["android", "ios", "web"],
-        }
-    }
-    opts["http_headers"] = {
-        "User-Agent": "com.google.android.youtube/19.29.37 (Linux; U; Android 11) gzip",
-    }
+    # Note: we intentionally do NOT force a specific player_client (e.g.
+    # android/ios) here. Forcing those clients avoids the bot-check on some
+    # videos but strips out format data on others — "Requested format is not
+    # available" for videos that work fine elsewhere is a symptom of that.
+    # With valid, fresh cookies the default web client is bypassed correctly
+    # and keeps the full format list intact.
     return opts
 
 
