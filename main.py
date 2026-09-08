@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -328,6 +329,29 @@ def save_progress(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
+
+
+@app.get("/download/{job_id}")
+def download_file(job_id: str):
+    """
+    Stream a completed job's file back to the browser so it actually saves
+    to the user's own device — previously jobs finished on the Railway
+    server with no way to retrieve them, since Railway's disk is ephemeral
+    and not visible to the user at all.
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=409, detail=f"Job is not completed yet (status: {job.get('status')})")
+    file_path = job.get("filename")
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(status_code=404, detail="Output file no longer exists on the server")
+    return FileResponse(
+        path=file_path,
+        filename=Path(file_path).name,
+        media_type="application/octet-stream",
+    )
 
 
 @app.post("/trim")
