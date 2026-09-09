@@ -162,32 +162,31 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
             jobs[job_id]["filename"] = d.get("filename", "")
 
     ydl_opts["progress_hooks"] = [progress_hook]
+    ydl_opts.setdefault("retries", 5)
+    ydl_opts.setdefault("fragment_retries", 5)
+    ydl_opts.setdefault("socket_timeout", 30)
 
-    # Different YouTube "player clients" (web, ios, android, tv) each expose
-    # their own format list, get rate-limited/blocked differently, and
-    # sometimes require a PO token that only some of them supply
-    # automatically. This is a moving target as YouTube changes its anti-bot
-    # rules, so rather than betting on one client we try several client +
-    # format combinations in turn and keep whichever actually works.
+    # Try yt-dlp's own default client selection FIRST — this is what the
+    # proven-working desktop version of this tool uses (no forced client at
+    # all), and forcing a specific player_client has caused more breakage
+    # than it fixed (e.g. "tv" itself being broken upstream). Only fall back
+    # to explicitly forcing "web" or "android" if the default path fails.
     original_format = ydl_opts.get("format")
-    # "tv" and "ios" removed: "tv" is currently broken upstream in yt-dlp
-    # itself (returns this exact "page needs to be reloaded" error — see
-    # yt-dlp/yt-dlp#17389), and "ios" silently ignores cookies entirely, so
-    # neither can use the account cookies configured in Settings. "web" and
-    # "android" both honor cookies and are the current reliable pair.
-    client_strategies = ["web", "android"]
     formats_to_try = [f for f in [original_format, "bv*+ba/b", "best"] if f]
-    # de-dupe while preserving order
     seen_f: set = set()
     formats_to_try = [f for f in formats_to_try if not (f in seen_f or seen_f.add(f))]
 
+    attempts = [{"extractor_args": None}, {"extractor_args": {"youtube": {"player_client": ["web"]}}},
+                {"extractor_args": {"youtube": {"player_client": ["android"]}}}]
+
     last_error = None
-    for client in client_strategies:
+    for attempt in attempts:
         for fmt in formats_to_try:
             try:
                 attempt_opts = dict(ydl_opts)
                 attempt_opts["format"] = fmt
-                attempt_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+                if attempt["extractor_args"] is not None:
+                    attempt_opts["extractor_args"] = attempt["extractor_args"]
                 with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     jobs[job_id]["status"] = "completed"
@@ -223,18 +222,31 @@ def media_info(req: MediaInfoRequest):
     """
     import yt_dlp
 
-    ydl_opts = with_cookies({
+    ydl_opts_base = with_cookies({
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
     })
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # Same reasoning as /save: try yt-dlp's default client selection first,
+    # only forcing a specific one if that fails.
+    attempts = [None, {"youtube": {"player_client": ["web"]}}, {"youtube": {"player_client": ["android"]}}]
+    info = None
+    last_error: Exception | None = None
+    for extractor_args in attempts:
+        try:
+            opts = dict(ydl_opts_base)
+            if extractor_args is not None:
+                opts["extractor_args"] = extractor_args
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(req.url, download=False)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    if info is None:
+        raise HTTPException(status_code=400, detail=str(last_error) if last_error else "Failed to fetch media info")
 
     # Build format list
     raw_formats = info.get("formats", [])
