@@ -170,7 +170,12 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
     # rules, so rather than betting on one client we try several client +
     # format combinations in turn and keep whichever actually works.
     original_format = ydl_opts.get("format")
-    client_strategies = ["web", "ios", "android", "tv"]
+    # "tv" and "ios" removed: "tv" is currently broken upstream in yt-dlp
+    # itself (returns this exact "page needs to be reloaded" error — see
+    # yt-dlp/yt-dlp#17389), and "ios" silently ignores cookies entirely, so
+    # neither can use the account cookies configured in Settings. "web" and
+    # "android" both honor cookies and are the current reliable pair.
+    client_strategies = ["web", "android"]
     formats_to_try = [f for f in [original_format, "bv*+ba/b", "best"] if f]
     # de-dupe while preserving order
     seen_f: set = set()
