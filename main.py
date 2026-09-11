@@ -176,8 +176,19 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
     seen_f: set = set()
     formats_to_try = [f for f in formats_to_try if not (f in seen_f or seen_f.add(f))]
 
-    attempts = [{"extractor_args": None}, {"extractor_args": {"youtube": {"player_client": ["web"]}}},
-                {"extractor_args": {"youtube": {"player_client": ["android"]}}}]
+    attempts = [
+        {"extractor_args": None},
+        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+        # YouTube's "SABR streaming" rollout (yt-dlp/yt-dlp#12482, an
+        # ongoing, still-unresolved fight between YouTube and yt-dlp as of
+        # 2026) strips download URLs from many formats unless a PO Token is
+        # presented. formats=missing_pot tells yt-dlp to include those
+        # formats anyway — usually lower quality, but still downloadable —
+        # instead of erroring out with nothing at all.
+        {"extractor_args": {"youtube": {"player_client": ["web"], "formats": ["missing_pot"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android"], "formats": ["missing_pot"]}}},
+    ]
 
     last_error = None
     for attempt in attempts:
@@ -231,7 +242,13 @@ def media_info(req: MediaInfoRequest):
 
     # Same reasoning as /save: try yt-dlp's default client selection first,
     # only forcing a specific one if that fails.
-    attempts = [None, {"youtube": {"player_client": ["web"]}}, {"youtube": {"player_client": ["android"]}}]
+    attempts = [
+        None,
+        {"youtube": {"player_client": ["web"]}},
+        {"youtube": {"player_client": ["android"]}},
+        {"youtube": {"player_client": ["web"], "formats": ["missing_pot"]}},
+        {"youtube": {"player_client": ["android"], "formats": ["missing_pot"]}},
+    ]
     info = None
     last_error: Exception | None = None
     for extractor_args in attempts:
