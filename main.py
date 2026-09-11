@@ -130,6 +130,7 @@ class TranslateVideoRequest(BaseModel):
     url: str
     mode: str = "subtitle"          # "subtitle" or "dub"
     target_lang: Optional[str] = "km"
+    subtitle_output: Optional[str] = "burn"       # "burn" or "srt" — only used for mode="subtitle"
     voice: Optional[str] = "km-KH-PisethNeural"   # only used for mode="dub"
 
 
@@ -303,7 +304,7 @@ def text_to_speech(text: str, out_path: Path, voice: str):
     asyncio.run(_tts_save(text, out_path, voice))
 
 
-def run_translate_job(job_id: str, url: str, mode: str, target_lang: str, voice: str):
+def run_translate_job(job_id: str, url: str, mode: str, target_lang: str, voice: str, subtitle_output: str = "burn"):
     """Background thread: download -> transcribe -> translate -> subtitle-burn or dub."""
     try:
         jobs[job_id]["status"] = "downloading"
@@ -354,12 +355,17 @@ def run_translate_job(job_id: str, url: str, mode: str, target_lang: str, voice:
                 raise RuntimeError(f"ffmpeg dub merge error: {result.stderr[-500:]}")
             jobs[job_id]["filename"] = str(out_path)
         else:
-            jobs[job_id]["stage"] = "burning_subtitles"
             srt_path = video_path.with_suffix(".srt")
             build_srt(segments, translated, srt_path)
-            out_path = DOWNLOAD_DIR / f"{video_path.stem}_sub.mp4"
-            burn_subtitles(video_path, srt_path, out_path)
-            jobs[job_id]["filename"] = str(out_path)
+            if subtitle_output == "srt":
+                # Just the subtitle file — pair it with a separately-downloaded video
+                jobs[job_id]["stage"] = "done"
+                jobs[job_id]["filename"] = str(srt_path)
+            else:
+                jobs[job_id]["stage"] = "burning_subtitles"
+                out_path = DOWNLOAD_DIR / f"{video_path.stem}_sub.mp4"
+                burn_subtitles(video_path, srt_path, out_path)
+                jobs[job_id]["filename"] = str(out_path)
 
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["stage"] = "done"
@@ -524,7 +530,7 @@ def translate_video(req: TranslateVideoRequest):
 
     t = threading.Thread(
         target=run_translate_job,
-        args=(job_id, req.url, req.mode, req.target_lang, req.voice),
+        args=(job_id, req.url, req.mode, req.target_lang, req.voice, req.subtitle_output),
         daemon=True,
     )
     t.start()
