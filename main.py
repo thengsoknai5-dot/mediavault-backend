@@ -5,7 +5,7 @@ Copy this file to: C:\Users\nguon\mediavault-backend\main.py
 Then run: python -m uvicorn main:app --reload --port 8000
 
 Requirements (already installed):
-  fastapi, uvicorn, yt-dlp, python-multipart, deep-translator
+  fastapi, uvicorn, yt-dlp, python-multipart, deep-translator, faster-whisper, edge-tts
 """
 
 import os
@@ -13,6 +13,7 @@ import uuid
 import asyncio
 import subprocess
 import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -44,25 +45,13 @@ DOWNLOAD_DIR = Path(os.path.expanduser("~")) / "mediavault-downloads"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── YouTube cookies (fixes "Sign in to confirm you're not a bot") ──────────────
-# Cookies can come from either the YOUTUBE_COOKIES env var (set once in Railway)
-# or be updated live via POST /settings/cookies from the app's Settings panel —
-# useful since YouTube session cookies expire every few days/weeks and editing
-# Railway variables + redeploying every time is slow. Either way they end up in
-# the same file on disk, and with_cookies() checks the file fresh on every
-# request so an update takes effect immediately with no restart needed.
 COOKIES_FILE = str(Path(os.path.expanduser("~")) / "mediavault-cookies.txt")
 
 _env_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
 if _env_cookies:
     Path(COOKIES_FILE).write_text(_env_cookies, encoding="utf-8")
 
-# ── PO Token provider (fixes "Requested format is not available" from
-# YouTube's SABR streaming rollout — yt-dlp/yt-dlp#12482) ──────────────────
-# Set POT_PROVIDER_URL to the internal URL of a running
-# brainicism/bgutil-ytdlp-pot-provider service (e.g. a second Railway
-# service reachable at http://<service-name>.railway.internal:4416). When
-# set, every yt-dlp call is told to fetch a Proof-of-Origin token from it,
-# which restores the download URLs YouTube otherwise strips from formats.
+# ── PO Token provider ───────────────────────────────────────────────────────
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").strip()
 
 
@@ -78,12 +67,6 @@ def with_cookies(opts: dict) -> dict:
     """Attach cookiefile for YouTube bot-check bypass."""
     if Path(COOKIES_FILE).exists() and Path(COOKIES_FILE).stat().st_size > 0:
         opts["cookiefile"] = COOKIES_FILE
-    # Note: we intentionally do NOT force a specific player_client (e.g.
-    # android/ios) here. Forcing those clients avoids the bot-check on some
-    # videos but strips out format data on others — "Requested format is not
-    # available" for videos that work fine elsewhere is a symptom of that.
-    # With valid, fresh cookies the default web client is bypassed correctly
-    # and keeps the full format list intact.
     return opts
 
 
@@ -93,7 +76,6 @@ class CookiesUpdateRequest(BaseModel):
 
 @app.post("/settings/cookies")
 async def update_cookies(req: CookiesUpdateRequest):
-    """Update the YouTube cookies file at runtime (no redeploy needed)."""
     content = req.cookies.strip()
     if not content:
         raise HTTPException(status_code=400, detail="cookies must not be empty")
@@ -103,7 +85,6 @@ async def update_cookies(req: CookiesUpdateRequest):
 
 @app.get("/settings/cookies-status")
 async def cookies_status():
-    """Whether cookies are currently configured, and roughly how fresh."""
     p = Path(COOKIES_FILE)
     if not p.exists() or p.stat().st_size == 0:
         return {"configured": False}
@@ -128,7 +109,8 @@ class SaveRequest(BaseModel):
 
 class TrimRequest(BaseModel):
     file_path: str
-    start_time: str   # e.g. "00:00:10" end_time: str     # e.g."00:01:30"
+    start_time: str
+    end_time: str
     output_name: Optional[str] = None
 
 
@@ -144,9 +126,15 @@ class DubAudioRequest(BaseModel):
     output_name: Optional[str] = None
 
 
+class TranslateVideoRequest(BaseModel):
+    url: str
+    mode: str = "subtitle"          # "subtitle" or "dub"
+    target_lang: Optional[str] = "km"
+    voice: Optional[str] = "km-KH-PisethNeural"   # only used for mode="dub"
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def format_duration(seconds: float) -> str:
-    """Convert seconds to HH:MM:SS string."""
     if not seconds:
         return "0:00"
     seconds = int(seconds)
@@ -158,10 +146,44 @@ def format_duration(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def run_download(job_id: str, url: str, ydl_opts: dict):
-    """Background thread: run yt-dlp download and update job store."""
+def _download_with_fallback(url: str, ydl_opts: dict):
+    """Shared multi-attempt yt-dlp download used by /save and /translate-video."""
     import yt_dlp
 
+    original_format = ydl_opts.get("format")
+    formats_to_try = [f for f in [original_format, "bv*+ba/b", "best"] if f]
+    seen_f: set = set()
+    formats_to_try = [f for f in formats_to_try if not (f in seen_f or seen_f.add(f))]
+
+    attempts = [
+        {"extractor_args": None},
+        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["web"], "formats": ["missing_pot"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android"], "formats": ["missing_pot"]}}},
+    ]
+
+    last_error = None
+    for attempt in attempts:
+        for fmt in formats_to_try:
+            try:
+                attempt_opts = dict(ydl_opts)
+                attempt_opts["format"] = fmt
+                if attempt["extractor_args"] is not None:
+                    attempt_opts["extractor_args"] = attempt["extractor_args"]
+                attempt_opts["extractor_args"] = merge_pot_provider(attempt_opts.get("extractor_args"))
+                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    return info, ydl.prepare_filename(info)
+            except Exception as e:
+                last_error = e
+                continue
+
+    raise RuntimeError(str(last_error) if last_error else "Download failed")
+
+
+def run_download(job_id: str, url: str, ydl_opts: dict):
+    """Background thread: run yt-dlp download and update job store."""
     jobs[job_id]["status"] = "downloading"
     jobs[job_id]["progress"] = 0
 
@@ -183,59 +205,174 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
     ydl_opts.setdefault("fragment_retries", 5)
     ydl_opts.setdefault("socket_timeout", 30)
 
-    # Try yt-dlp's own default client selection FIRST — this is what the
-    # proven-working desktop version of this tool uses (no forced client at
-    # all), and forcing a specific player_client has caused more breakage
-    # than it fixed (e.g. "tv" itself being broken upstream). Only fall back
-    # to explicitly forcing "web" or "android" if the default path fails.
-    original_format = ydl_opts.get("format")
-    formats_to_try = [f for f in [original_format, "bv*+ba/b", "best"] if f]
-    seen_f: set = set()
-    formats_to_try = [f for f in formats_to_try if not (f in seen_f or seen_f.add(f))]
+    try:
+        info, filename = _download_with_fallback(url, ydl_opts)
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["progress"] = 100
+        jobs[job_id]["title"] = info.get("title", "")
+        jobs[job_id]["filename"] = filename
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
 
-    attempts = [
-        {"extractor_args": None},
-        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-        # YouTube's "SABR streaming" rollout (yt-dlp/yt-dlp#12482, an
-        # ongoing, still-unresolved fight between YouTube and yt-dlp as of
-        # 2026) strips download URLs from many formats unless a PO Token is
-        # presented. formats=missing_pot tells yt-dlp to include those
-        # formats anyway — usually lower quality, but still downloadable —
-        # instead of erroring out with nothing at all.
-        {"extractor_args": {"youtube": {"player_client": ["web"], "formats": ["missing_pot"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["android"], "formats": ["missing_pot"]}}},
-    ]
 
-    last_error = None
-    for attempt in attempts:
-        for fmt in formats_to_try:
-            try:
-                attempt_opts = dict(ydl_opts)
-                attempt_opts["format"] = fmt
-                if attempt["extractor_args"] is not None:
-                    attempt_opts["extractor_args"] = attempt["extractor_args"]
-                attempt_opts["extractor_args"] = merge_pot_provider(attempt_opts.get("extractor_args"))
-                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    jobs[job_id]["status"] = "completed"
-                    jobs[job_id]["progress"] = 100
-                    jobs[job_id]["title"] = info.get("title", "")
-                    jobs[job_id]["filename"] = ydl.prepare_filename(info)
-                    return
-            except Exception as e:
-                last_error = e
-                continue
+# ── Translate / Dub pipeline helpers ────────────────────────────────────────
+_whisper_model = None
 
-    jobs[job_id]["status"] = "error"
-    jobs[job_id]["error"] = str(last_error) if last_error else "Download failed"
+
+def get_whisper_model():
+    """Lazy-load faster-whisper model once per process."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        size = os.environ.get("WHISPER_MODEL_SIZE", "base")
+        _whisper_model = WhisperModel(size, device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def extract_audio(video_path: Path) -> Path:
+    audio_path = video_path.with_suffix(".wav")
+    cmd = ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "pcm_s16le",
+           "-ar", "16000", "-ac", "1", str(audio_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio extract error: {result.stderr[-500:]}")
+    return audio_path
+
+
+def transcribe_audio(audio_path: Path):
+    """Returns (segments[{start,end,text}], detected_language)."""
+    model = get_whisper_model()
+    segments_iter, info = model.transcribe(str(audio_path), beam_size=5)
+    segments = [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments_iter]
+    return segments, info.language
+
+
+def translate_texts(texts, target_lang="km", source_lang="auto"):
+    from deep_translator import GoogleTranslator
+    translator = GoogleTranslator(source=source_lang, target=target_lang)
+    out = []
+    for t in texts:
+        if not t.strip():
+            out.append("")
+            continue
+        try:
+            out.append(translator.translate(t))
+        except Exception:
+            out.append(t)  # fall back to original text rather than failing the whole job
+    return out
+
+
+def _srt_timestamp(seconds: float) -> str:
+    total_ms = int(seconds * 1000)
+    h = total_ms // 3600000
+    m = (total_ms % 3600000) // 60000
+    s = (total_ms % 60000) // 1000
+    ms = total_ms % 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_srt(segments, translated_texts, out_path: Path):
+    lines = []
+    for i, (seg, text) in enumerate(zip(segments, translated_texts), start=1):
+        if not text.strip():
+            continue
+        lines.append(str(i))
+        lines.append(f"{_srt_timestamp(seg['start'])} --> {_srt_timestamp(seg['end'])}")
+        lines.append(text)
+        lines.append("")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def burn_subtitles(video_path: Path, srt_path: Path, out_path: Path):
+    escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
+    cmd = ["ffmpeg", "-y", "-i", str(video_path), "-vf", f"subtitles='{escaped}'",
+           "-c:a", "copy", str(out_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg subtitle burn error: {result.stderr[-500:]}")
+
+
+async def _tts_save(text: str, out_path: Path, voice: str):
+    import edge_tts
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(str(out_path))
+
+
+def text_to_speech(text: str, out_path: Path, voice: str):
+    asyncio.run(_tts_save(text, out_path, voice))
+
+
+def run_translate_job(job_id: str, url: str, mode: str, target_lang: str, voice: str):
+    """Background thread: download -> transcribe -> translate -> subtitle-burn or dub."""
+    try:
+        jobs[job_id]["status"] = "downloading"
+        jobs[job_id]["stage"] = "downloading"
+        jobs[job_id]["progress"] = 5
+
+        output_template = str(DOWNLOAD_DIR / "%(title)s.%(ext)s")
+        ydl_opts = with_cookies({
+            "outtmpl": output_template,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format": "bv*+ba/b",
+            "merge_output_format": "mp4",
+        })
+        info, video_file = _download_with_fallback(url, ydl_opts)
+        video_path = Path(video_file)
+        jobs[job_id]["title"] = info.get("title", "")
+        jobs[job_id]["progress"] = 30
+
+        jobs[job_id]["stage"] = "extracting_audio"
+        audio_path = extract_audio(video_path)
+        jobs[job_id]["progress"] = 40
+
+        jobs[job_id]["stage"] = "transcribing"
+        segments, detected_lang = transcribe_audio(audio_path)
+        jobs[job_id]["detected_language"] = detected_lang
+        jobs[job_id]["progress"] = 60
+
+        jobs[job_id]["stage"] = "translating"
+        texts = [s["text"] for s in segments]
+        translated = translate_texts(texts, target_lang=target_lang, source_lang="auto")
+        jobs[job_id]["progress"] = 75
+
+        if mode == "dub":
+            jobs[job_id]["stage"] = "generating_speech"
+            full_text = " ".join(t for t in translated if t)
+            dub_audio_path = video_path.with_name(video_path.stem + "_dub_audio.mp3")
+            text_to_speech(full_text, dub_audio_path, voice)
+            jobs[job_id]["progress"] = 88
+
+            jobs[job_id]["stage"] = "merging"
+            out_path = DOWNLOAD_DIR / f"{video_path.stem}_dubbed.mp4"
+            cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(dub_audio_path),
+                   "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(out_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg dub merge error: {result.stderr[-500:]}")
+            jobs[job_id]["filename"] = str(out_path)
+        else:
+            jobs[job_id]["stage"] = "burning_subtitles"
+            srt_path = video_path.with_suffix(".srt")
+            build_srt(segments, translated, srt_path)
+            out_path = DOWNLOAD_DIR / f"{video_path.stem}_sub.mp4"
+            burn_subtitles(video_path, srt_path, out_path)
+            jobs[job_id]["filename"] = str(out_path)
+
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["stage"] = "done"
+        jobs[job_id]["progress"] = 100
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    """Health check — frontend polls this to show green/red dot."""
     return {
         "status": "ok",
         "message": "MediaVault backend is running",
@@ -246,10 +383,6 @@ def health():
 
 @app.post("/media-info")
 def media_info(req: MediaInfoRequest):
-    """
-    Fetch video metadata using yt-dlp (no download).
-    Returns title, duration, thumbnail, formats, etc.
-    """
     import yt_dlp
 
     ydl_opts_base = with_cookies({
@@ -259,8 +392,6 @@ def media_info(req: MediaInfoRequest):
         "noplaylist": True,
     })
 
-    # Same reasoning as /save: try yt-dlp's default client selection first,
-    # only forcing a specific one if that fails.
     attempts = [
         None,
         {"youtube": {"player_client": ["web"]}},
@@ -285,7 +416,6 @@ def media_info(req: MediaInfoRequest):
     if info is None:
         raise HTTPException(status_code=400, detail=str(last_error) if last_error else "Failed to fetch media info")
 
-    # Build format list
     raw_formats = info.get("formats", [])
     formats = []
     seen = set()
@@ -326,10 +456,6 @@ def media_info(req: MediaInfoRequest):
 
 @app.post("/save")
 def save(req: SaveRequest, background_tasks: BackgroundTasks):
-    """
-    Start a yt-dlp download job.
-    Returns a job_id for polling via /save-progress.
-    """
     job_id = str(uuid.uuid4())
 
     output_template = str(DOWNLOAD_DIR / (req.output_name or "%(title)s.%(ext)s"))
@@ -349,13 +475,6 @@ def save(req: SaveRequest, background_tasks: BackgroundTasks):
             "preferredquality": "192",
         }]
     else:
-        # Deliberately ignore req.format_id: format IDs returned by
-        # /media-info come from whichever player client (web/android/ios)
-        # yt-dlp used for that call, and the same ID may not exist when
-        # /save runs its own extraction — that mismatch caused "Requested
-        # format is not available". "bv*+ba/b" is a flexible selector: best
-        # video (any codec/container) + best audio, falling back to the
-        # single best pre-merged stream if that combination fails.
         ydl_opts["format"] = "bv*+ba/b"
         ydl_opts["merge_output_format"] = "mp4"
 
@@ -379,9 +498,42 @@ def save(req: SaveRequest, background_tasks: BackgroundTasks):
     return {"job_id": job_id, "status": "queued", "download_dir": str(DOWNLOAD_DIR)}
 
 
+@app.post("/translate-video")
+def translate_video(req: TranslateVideoRequest):
+    """
+    Download a video and produce a Khmer-translated version:
+      mode="subtitle" -> Khmer .srt burned into the video (fast, cheap)
+      mode="dub"      -> original audio replaced with Khmer TTS voice (slower)
+    Poll status with the existing /save-progress/{job_id} and fetch the
+    finished file with the existing /download/{job_id}.
+    """
+    if req.mode not in ("subtitle", "dub"):
+        raise HTTPException(status_code=400, detail="mode must be 'subtitle' or 'dub'")
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "queued",
+        "stage": "queued",
+        "progress": 0,
+        "url": req.url,
+        "mode": req.mode,
+        "target_lang": req.target_lang,
+        "filename": "",
+        "error": "",
+    }
+
+    t = threading.Thread(
+        target=run_translate_job,
+        args=(job_id, req.url, req.mode, req.target_lang, req.voice),
+        daemon=True,
+    )
+    t.start()
+
+    return {"job_id": job_id, "status": "queued", "mode": req.mode}
+
+
 @app.get("/save-progress/{job_id}")
 def save_progress(job_id: str):
-    """Poll download progress for a given job_id."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
@@ -389,12 +541,6 @@ def save_progress(job_id: str):
 
 @app.get("/download/{job_id}")
 def download_file(job_id: str):
-    """
-    Stream a completed job's file back to the browser so it actually saves
-    to the user's own device — previously jobs finished on the Railway
-    server with no way to retrieve them, since Railway's disk is ephemeral
-    and not visible to the user at all.
-    """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     job = jobs[job_id]
@@ -412,10 +558,6 @@ def download_file(job_id: str):
 
 @app.post("/trim")
 def trim(req: TrimRequest):
-    """
-    Trim a video/audio file using ffmpeg.
-    Requires ffmpeg to be installed and on PATH.
-    """
     input_path = Path(req.file_path)
     if not input_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {req.file_path}")
@@ -434,44 +576,22 @@ def trim(req: TrimRequest):
     ]
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"ffmpeg error: {result.stderr[-500:]}"
-            )
+            raise HTTPException(status_code=500, detail=f"ffmpeg error: {result.stderr[-500:]}")
     except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="ffmpeg not found. Install ffmpeg and add it to PATH."
-        )
+        raise HTTPException(status_code=500, detail="ffmpeg not found. Install ffmpeg and add it to PATH.")
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=500, detail="ffmpeg timed out")
 
-    return {
-        "status": "completed",
-        "output_path": str(output_path),
-        "output_name": out_name,
-    }
+    return {"status": "completed", "output_path": str(output_path), "output_name": out_name}
 
 
 @app.post("/translate-subtitle")
 def translate_subtitle(req: TranslateSubtitleRequest):
-    """
-    Translate text using deep-translator (Google Translate backend).
-    """
     try:
         from deep_translator import GoogleTranslator
-        translator = GoogleTranslator(
-            source=req.source_lang,
-            target=req.target_lang,
-        )
-        # deep-translator has a 5000-char limit per call — chunk if needed
+        translator = GoogleTranslator(source=req.source_lang, target=req.target_lang)
         MAX_CHUNK = 4500
         text = req.text
         if len(text) <= MAX_CHUNK:
@@ -493,9 +613,6 @@ def translate_subtitle(req: TranslateSubtitleRequest):
 
 @app.post("/dub-audio")
 def dub_audio(req: DubAudioRequest):
-    """
-    Replace the audio track of a video with a new audio file using ffmpeg.
-    """
     video_path = Path(req.video_path)
     audio_path = Path(req.audio_path)
 
@@ -519,30 +636,15 @@ def dub_audio(req: DubAudioRequest):
     ]
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"ffmpeg error: {result.stderr[-500:]}"
-            )
+            raise HTTPException(status_code=500, detail=f"ffmpeg error: {result.stderr[-500:]}")
     except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="ffmpeg not found. Install ffmpeg and add it to PATH."
-        )
+        raise HTTPException(status_code=500, detail="ffmpeg not found. Install ffmpeg and add it to PATH.")
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=500, detail="ffmpeg timed out")
 
-    return {
-        "status": "completed",
-        "output_path": str(output_path),
-        "output_name": out_name,
-    }
+    return {"status": "completed", "output_path": str(output_path), "output_name": out_name}
 
 
 # ── Dev entry point ────────────────────────────────────────────────────────────
