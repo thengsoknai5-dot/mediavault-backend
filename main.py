@@ -56,6 +56,23 @@ _env_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
 if _env_cookies:
     Path(COOKIES_FILE).write_text(_env_cookies, encoding="utf-8")
 
+# ── PO Token provider (fixes "Requested format is not available" from
+# YouTube's SABR streaming rollout — yt-dlp/yt-dlp#12482) ──────────────────
+# Set POT_PROVIDER_URL to the internal URL of a running
+# brainicism/bgutil-ytdlp-pot-provider service (e.g. a second Railway
+# service reachable at http://<service-name>.railway.internal:4416). When
+# set, every yt-dlp call is told to fetch a Proof-of-Origin token from it,
+# which restores the download URLs YouTube otherwise strips from formats.
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").strip()
+
+
+def merge_pot_provider(extractor_args: Optional[dict]) -> Optional[dict]:
+    if not POT_PROVIDER_URL:
+        return extractor_args
+    merged = dict(extractor_args) if extractor_args else {}
+    merged["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
+    return merged
+
 
 def with_cookies(opts: dict) -> dict:
     """Attach cookiefile for YouTube bot-check bypass."""
@@ -198,6 +215,7 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
                 attempt_opts["format"] = fmt
                 if attempt["extractor_args"] is not None:
                     attempt_opts["extractor_args"] = attempt["extractor_args"]
+                attempt_opts["extractor_args"] = merge_pot_provider(attempt_opts.get("extractor_args"))
                 with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     jobs[job_id]["status"] = "completed"
@@ -222,6 +240,7 @@ def health():
         "status": "ok",
         "message": "MediaVault backend is running",
         "youtube_cookies_configured": Path(COOKIES_FILE).exists() and Path(COOKIES_FILE).stat().st_size > 0,
+        "pot_provider_configured": bool(POT_PROVIDER_URL),
     }
 
 
@@ -256,6 +275,7 @@ def media_info(req: MediaInfoRequest):
             opts = dict(ydl_opts_base)
             if extractor_args is not None:
                 opts["extractor_args"] = extractor_args
+            opts["extractor_args"] = merge_pot_provider(opts.get("extractor_args"))
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(req.url, download=False)
             break
