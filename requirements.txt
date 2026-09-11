@@ -4,3 +4,4 @@ python-multipart
 yt-dlp
 deep-translator
 argostranslate
+bgutil-ytdlp-pot-provider
