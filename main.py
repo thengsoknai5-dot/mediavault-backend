@@ -9,6 +9,7 @@ Requirements (already installed):
 """
 
 import os
+import time
 import uuid
 import asyncio
 import subprocess
@@ -249,18 +250,82 @@ def transcribe_audio(audio_path: Path):
     return segments, info.language
 
 
+def _looks_like_translate_error(text: str) -> bool:
+    """Detect Google's own rate-limit/error page coming back as if it were a translation."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        "error 500" in lowered
+        or "that\u2019s an error" in lowered
+        or "that's an error" in lowered
+        or "<html" in lowered
+    )
+
+
+def _translate_one(translator, text: str, retries: int = 3) -> str:
+    for attempt in range(retries):
+        try:
+            result = translator.translate(text)
+            if result and not _looks_like_translate_error(result):
+                return result
+        except Exception:
+            pass
+        time.sleep(1.5 * (attempt + 1))  # back off before retrying
+    return text  # give up — fall back to the original text rather than saving an error page
+
+
 def translate_texts(texts, target_lang="km", source_lang="auto"):
+    """
+    Translate many short lines while avoiding Google Translate's rate limiting.
+    Batches lines together (far fewer HTTP calls than one-per-line) and only
+    falls back to slower one-by-one calls for a batch that didn't come back
+    clean (mismatched line count or an error page).
+    """
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source=source_lang, target=target_lang)
-    out = []
-    for t in texts:
-        if not t.strip():
-            out.append("")
-            continue
-        try:
-            out.append(translator.translate(t))
-        except Exception:
-            out.append(t)  # fall back to original text rather than failing the whole job
+
+    SEP = "\n¤¤¤\n"
+    MAX_CHUNK = 3500  # stay well under deep-translator's ~5000 char request limit
+
+    out = [""] * len(texts)
+    indices = [i for i, t in enumerate(texts) if t.strip()]
+    if not indices:
+        return out
+
+    # Group indices into batches that fit under MAX_CHUNK once joined by SEP
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_len = 0
+    for i in indices:
+        t_len = len(texts[i]) + len(SEP)
+        if current and current_len + t_len > MAX_CHUNK:
+            batches.append(current)
+            current = []
+            current_len = 0
+        current.append(i)
+        current_len += t_len
+    if current:
+        batches.append(current)
+
+    for batch in batches:
+        joined = SEP.join(texts[i] for i in batch)
+        translated_joined = _translate_one(translator, joined)
+        parts = translated_joined.split(SEP)
+
+        if len(parts) == len(batch) and not _looks_like_translate_error(translated_joined):
+            for i, part in zip(batch, parts):
+                out[i] = part.strip()
+        else:
+            # Batch didn't come back clean (Google may have dropped the
+            # separator) — fall back to translating this batch's lines
+            # one at a time, with pacing to avoid tripping the rate limit.
+            for i in batch:
+                out[i] = _translate_one(translator, texts[i])
+                time.sleep(0.8)
+
+        time.sleep(1.0)  # pace requests between batches
+
     return out
 
 
