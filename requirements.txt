@@ -5,5 +5,5 @@ yt-dlp
 deep-translator
 argostranslate
 bgutil-ytdlp-pot-provider
-faster-whisper
+requests
 edge-tts
