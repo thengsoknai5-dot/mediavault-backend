@@ -5,7 +5,7 @@ Copy this file to: C:\Users\nguon\mediavault-backend\main.py
 Then run: python -m uvicorn main:app --reload --port 8000
 
 Requirements (already installed):
-  fastapi, uvicorn, yt-dlp, python-multipart, deep-translator, faster-whisper, edge-tts
+  fastapi, uvicorn, yt-dlp, python-multipart, deep-translator, requests, edge-tts
 """
 
 import os
@@ -219,17 +219,8 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
 
 
 # ── Translate / Dub pipeline helpers ────────────────────────────────────────
-_whisper_model = None
-
-
-def get_whisper_model():
-    """Lazy-load faster-whisper model once per process."""
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        size = os.environ.get("WHISPER_MODEL_SIZE", "base")
-        _whisper_model = WhisperModel(size, device="cpu", compute_type="int8")
-    return _whisper_model
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "").strip()
+ASSEMBLYAI_BASE = "https://api.assemblyai.com/v2"
 
 
 def extract_audio(video_path: Path) -> Path:
@@ -243,11 +234,58 @@ def extract_audio(video_path: Path) -> Path:
 
 
 def transcribe_audio(audio_path: Path):
-    """Returns (segments[{start,end,text}], detected_language)."""
-    model = get_whisper_model()
-    segments_iter, info = model.transcribe(str(audio_path), beam_size=5)
-    segments = [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments_iter]
-    return segments, info.language
+    """
+    Transcribe using AssemblyAI's cloud API instead of a local Whisper model —
+    this runs on AssemblyAI's servers, so it doesn't compete with the app for
+    Railway's limited container RAM. Returns (segments[{start,end,text}], detected_language).
+    """
+    import requests
+
+    if not ASSEMBLYAI_API_KEY:
+        raise RuntimeError("ASSEMBLYAI_API_KEY is not set — add it in Railway Variables")
+
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
+
+    with open(audio_path, "rb") as f:
+        upload_res = requests.post(f"{ASSEMBLYAI_BASE}/upload", headers=headers, data=f, timeout=300)
+    upload_res.raise_for_status()
+    upload_url = upload_res.json()["upload_url"]
+
+    create_res = requests.post(
+        f"{ASSEMBLYAI_BASE}/transcript",
+        headers=headers,
+        json={"audio_url": upload_url, "language_detection": True},
+        timeout=30,
+    )
+    create_res.raise_for_status()
+    transcript_id = create_res.json()["id"]
+    status_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
+
+    data = {}
+    for _ in range(240):  # up to ~20 minutes of polling for long videos
+        poll_res = requests.get(status_url, headers=headers, timeout=30)
+        poll_res.raise_for_status()
+        data = poll_res.json()
+        if data.get("status") == "completed":
+            break
+        if data.get("status") == "error":
+            raise RuntimeError(f"AssemblyAI error: {data.get('error')}")
+        time.sleep(5)
+    else:
+        raise RuntimeError("AssemblyAI transcription timed out")
+
+    detected_lang = data.get("language_code") or "en"
+
+    sentences_res = requests.get(f"{status_url}/sentences", headers=headers, timeout=30)
+    sentences_res.raise_for_status()
+    sentences = sentences_res.json().get("sentences", [])
+
+    segments = [
+        {"start": s["start"] / 1000.0, "end": s["end"] / 1000.0, "text": s["text"].strip()}
+        for s in sentences
+        if s.get("text", "").strip()
+    ]
+    return segments, detected_lang
 
 
 def _looks_like_translate_error(text: str) -> bool:
@@ -449,6 +487,7 @@ def health():
         "message": "MediaVault backend is running",
         "youtube_cookies_configured": Path(COOKIES_FILE).exists() and Path(COOKIES_FILE).stat().st_size > 0,
         "pot_provider_configured": bool(POT_PROVIDER_URL),
+        "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
     }
 
 
