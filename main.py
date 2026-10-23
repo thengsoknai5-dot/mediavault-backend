@@ -414,7 +414,7 @@ def run_translate_job(job_id: str, url: str, mode: str, target_lang: str, voice:
         jobs[job_id]["stage"] = "downloading"
         jobs[job_id]["progress"] = 5
 
-        output_template = str(DOWNLOAD_DIR / "%(title)s.%(ext)s")
+        output_template = str(DOWNLOAD_DIR / "%(title).60B [%(id)s].%(ext)s")
         ydl_opts = with_cookies({
             "outtmpl": output_template,
             "quiet": True,
